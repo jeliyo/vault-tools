@@ -1,0 +1,45 @@
+injector:
+#   image:
+#     tag: dev
+  agentImage:
+    tag: dev
+    repository: vault
+  logLevel: debug
+  affinity: ""
+  replicas: 2
+
+server:
+  image:
+    tag: dev
+    repository: vault
+  dev:
+    enabled: true
+#   ha:
+#     enabled: true
+#     replicas: 3
+#     raft:
+#       enabled: true
+  logLevel: debug
+  affinity: ""
+  volumes:
+  - name: kube-api-access
+    projected:
+      defaultMode: 420 # 0644
+      sources:
+      - serviceAccountToken:
+          expirationSeconds: 600
+          path: token
+      - configMap:
+          items:
+            - key: ca.crt
+              path: ca.crt
+          name: kube-root-ca.crt
+      - downwardAPI:
+          items:
+            - fieldRef:
+                apiVersion: v1
+                fieldPath: metadata.namespace
+              path: namespace
+  volumeMounts:
+  - mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+    name: kube-api-access

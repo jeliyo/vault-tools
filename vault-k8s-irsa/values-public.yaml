@@ -1,0 +1,12 @@
+injector:
+#   image:
+#     repository: tvoran/vault-k8s
+#     tag: dev
+#     pullPolicy: Always
+  externalVaultAddr: https://tvoran-vault-cluster.vault.71caa8e4-39ee-44b9-96b1-84276e8ec5cf.aws.hashicorp.cloud:8200
+
+server:
+  enabled: false
+
+csi:
+  enabled: false

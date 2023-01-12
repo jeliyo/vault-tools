@@ -1,0 +1,348 @@
+diff --git a/agent-inject/agent/agent.go b/agent-inject/agent/agent.go
+index c36f5f8..6d1cf91 100644
+--- a/agent-inject/agent/agent.go
++++ b/agent-inject/agent/agent.go
+@@ -158,6 +158,9 @@ type Agent struct {
+ 	// InjectToken controls whether the auto-auth token is injected into the
+ 	// secrets volume (e.g. /vault/secrets/token)
+ 	InjectToken bool
++
++	// InjectDirect - inject vault-agent directly into the app container (no sidecars)
++	InjectDirect bool
+ }
+ 
+ type ServiceAccountTokenVolume struct {
+@@ -197,6 +200,9 @@ type Secret struct {
+ 
+ 	// FilePermission is the optional file permission for the rendered secret file
+ 	FilePermission string
++
++	// SetAsEnv - The name of the environment variable to set this as
++	SetAsEnv string
+ }
+ 
+ type Vault struct {
+@@ -348,6 +354,11 @@ func New(pod *corev1.Pod, patches []*jsonpatch.JsonPatchOperation) (*Agent, erro
+ 		return agent, err
+ 	}
+ 
++	agent.InjectDirect, err = agent.injectDirect()
++	if err != nil {
++		return agent, err
++	}
++
+ 	agent.InitFirst, err = agent.initFirst()
+ 	if err != nil {
+ 		return agent, err
+@@ -538,7 +549,7 @@ func (a *Agent) Patch() ([]byte, error) {
+ 	}
+ 
+ 	// Init Container
+-	if a.PrePopulate {
++	if a.PrePopulate && !a.InjectDirect {
+ 		container, err := a.ContainerInitSidecar()
+ 		if err != nil {
+ 			return patches, err
+@@ -584,7 +595,7 @@ func (a *Agent) Patch() ([]byte, error) {
+ 	}
+ 
+ 	// Sidecar Container
+-	if !a.PrePopulateOnly {
++	if !a.PrePopulateOnly && !a.InjectDirect {
+ 		container, err := a.ContainerSidecar()
+ 		if err != nil {
+ 			return patches, err
+@@ -595,6 +606,55 @@ func (a *Agent) Patch() ([]byte, error) {
+ 			"/spec/containers")...)
+ 	}
+ 
++	if a.InjectDirect {
++		// Add init container that copies the vault binary into the vault home
++		// directory
++		injectContainer, err := a.InjectContainer()
++		if err != nil {
++			return patches, err
++		}
++		a.Patches = append(a.Patches, addContainers(
++			a.Pod.Spec.InitContainers,
++			[]corev1.Container{injectContainer},
++			"/spec/initContainers")...)
++
++		// need to mount vault home dir here
++		volumeMounts := a.directInjectVolumeMounts()
++
++		// cheating here and just configuring as an init container, to run and exit
++		envs, err := a.ContainerEnvVars(true)
++		if err != nil {
++			return patches, err
++		}
++
++		for i, container := range a.Pod.Spec.Containers {
++			if strutil.StrListContains(a.Containers, container.Name) {
++				a.Patches = append(a.Patches, addVolumeMounts(
++					container.VolumeMounts,
++					volumeMounts,
++					fmt.Sprintf("/spec/containers/%d/volumeMounts", i))...)
++
++				a.Patches = append(a.Patches, addEnvVars(
++					container.Env,
++					envs,
++					fmt.Sprintf("/spec/containers/%d/env", i))...)
++
++				// TODO(tvoran): lookup container entrypoint if command and args are empty
++				oldCommand := container.Command
++				oldArgs := container.Args
++				newCommand := []string{"/bin/sh", "-ec"}
++				injectContainerArg := fmt.Sprintf("echo ${VAULT_CONFIG?} | base64 -d > /home/vault/config.json && %s/vault agent -config=/home/vault/config.json -wrap-process=true", tokenVolumePath)
++				newArgs := injectContainerArg + " -- " + strings.Join(oldCommand, " ") + " " + strings.Join(oldArgs, " ")
++				a.Patches = append(a.Patches, replaceSlice(
++					newCommand,
++					fmt.Sprintf("/spec/containers/%d/command", i))...)
++				a.Patches = append(a.Patches, replaceSlice(
++					[]string{newArgs},
++					fmt.Sprintf("/spec/containers/%d/args", i))...)
++			}
++		}
++	}
++
+ 	// Add annotations so that we know we're injected
+ 	a.Patches = append(a.Patches, updateAnnotations(
+ 		a.Pod.Annotations,
+@@ -790,3 +850,51 @@ func (a *Agent) copyVolumeMounts(targetContainerName string) []corev1.VolumeMoun
+ 	}
+ 	return copiedVolumeMounts
+ }
++
++func (a *Agent) directInjectVolumeMounts() []corev1.VolumeMount {
++	// Add Volume Mounts
++	volumeMounts := []corev1.VolumeMount{
++		// {
++		// 	Name:      a.ServiceAccountTokenVolume.Name,
++		// 	MountPath: a.ServiceAccountTokenVolume.MountPath,
++		// 	ReadOnly:  false,
++		// },
++		{
++			Name:      tokenVolumeNameSidecar,
++			MountPath: tokenVolumePath,
++			ReadOnly:  false,
++		},
++	}
++	if a.ExtraSecret != "" {
++		volumeMounts = append(volumeMounts, corev1.VolumeMount{
++			Name:      extraSecretVolumeName,
++			MountPath: extraSecretVolumePath,
++			ReadOnly:  true,
++		})
++	}
++
++	// arg := DefaultContainerArg
++
++	// if a.ConfigMapName != "" {
++	// 	volumeMounts = append(volumeMounts, corev1.VolumeMount{
++	// 		Name:      configVolumeName,
++	// 		MountPath: configVolumePath,
++	// 		ReadOnly:  true,
++	// 	})
++	// 	arg = fmt.Sprintf("touch %s && vault agent -config=%s/config.hcl", TokenFile, configVolumePath)
++	// }
++
++	if a.Vault.TLSSecret != "" {
++		volumeMounts = append(volumeMounts, corev1.VolumeMount{
++			Name:      tlsSecretVolumeName,
++			MountPath: tlsSecretVolumePath,
++			ReadOnly:  true,
++		})
++	}
++
++	if a.VaultAgentCache.Persist {
++		volumeMounts = append(volumeMounts, a.cacheVolumeMount())
++	}
++
++	return volumeMounts
++}
+diff --git a/agent-inject/agent/annotations.go b/agent-inject/agent/annotations.go
+index 33b4503..810fbdf 100644
+--- a/agent-inject/agent/annotations.go
++++ b/agent-inject/agent/annotations.go
+@@ -54,6 +54,19 @@ const (
+ 	// If not provided, a default generic template is used.
+ 	AnnotationAgentInjectTemplate = "vault.hashicorp.com/agent-inject-template"
+ 
++	// AnnotationAgentInjectAsEnv is the key annotation for marking a secret as
++	// one to set as a variable in vault-agent's environment. The name of the
++	// secret is the string after "vault.hashicorp.com/agent-inject-as-env-",
++	// and should map to the same unique value provided in
++	// "vault.hashicorp.com/agent-inject-secret-". The value of this annotation
++	// is the name of the environment variable to set. Typically used with the
++	// "agent-inject-env" annotation.
++	AnnotationAgentInjectAsEnv = "vault.hashicorp.com/agent-inject-as-env"
++
++	// AnnotationAgentInjectDirect - Inject vault-agent as a wrapper around the
++	// app command
++	AnnotationAgentInjectDirect = "vault.hashicorp.com/agent-inject-direct"
++
+ 	// AnnotationAgentInjectContainers is the key of the annotation that controls
+ 	// in which containers the secrets volume should be mounted. Multiple containers can
+ 	// be specified in a comma-separated list. If not provided, the secrets volume will
+@@ -439,10 +452,15 @@ func Init(pod *corev1.Pod, cfg AgentConfig) error {
+ 	if _, ok := pod.ObjectMeta.Annotations[AnnotationTemplateConfigExitOnRetryFailure]; !ok {
+ 		pod.ObjectMeta.Annotations[AnnotationTemplateConfigExitOnRetryFailure] = strconv.FormatBool(cfg.ExitOnRetryFailure)
+ 	}
++
+ 	if _, ok := pod.ObjectMeta.Annotations[AnnotationTemplateConfigStaticSecretRenderInterval]; !ok {
+ 		pod.ObjectMeta.Annotations[AnnotationTemplateConfigStaticSecretRenderInterval] = cfg.StaticSecretRenderInterval
+ 	}
+ 
++	if _, ok := pod.ObjectMeta.Annotations[AnnotationAgentInjectDirect]; !ok {
++		pod.ObjectMeta.Annotations[AnnotationAgentInjectDirect] = strconv.FormatBool(false)
++	}
++
+ 	return nil
+ }
+ 
+@@ -505,6 +523,11 @@ func (a *Agent) secrets() []*Secret {
+ 				s.FilePermission = val
+ 			}
+ 
++			setAsEnv := fmt.Sprintf("%s-%s", AnnotationAgentInjectAsEnv, raw)
++			if val, ok := a.Annotations[setAsEnv]; ok {
++				s.SetAsEnv = val
++			}
++
+ 			secrets = append(secrets, s)
+ 		}
+ 	}
+@@ -520,6 +543,15 @@ func (a *Agent) inject() (bool, error) {
+ 	return strconv.ParseBool(raw)
+ }
+ 
++func (a *Agent) injectDirect() (bool, error) {
++	raw, ok := a.Annotations[AnnotationAgentInjectDirect]
++	if !ok {
++		return false, nil
++	}
++
++	return strconv.ParseBool(raw)
++}
++
+ func (a *Agent) initFirst() (bool, error) {
+ 	raw, ok := a.Annotations[AnnotationAgentInitFirst]
+ 	if !ok {
+diff --git a/agent-inject/agent/config.go b/agent-inject/agent/config.go
+index d0f9772..0ae615e 100644
+--- a/agent-inject/agent/config.go
++++ b/agent-inject/agent/config.go
+@@ -78,6 +78,7 @@ type Template struct {
+ 	Command        string `json:"command,omitempty"`
+ 	Source         string `json:"source,omitempty"`
+ 	Perms          string `json:"perms,omitempty"`
++	SetAsEnv       bool   `json:"set_as_env,omitempty"`
+ }
+ 
+ // Listener defines the configuration for Vault Agent Cache Listener
+@@ -141,6 +142,10 @@ func (a *Agent) newTemplateConfigs() []*Template {
+ 		if secret.FilePermission != "" {
+ 			tmpl.Perms = secret.FilePermission
+ 		}
++		if secret.SetAsEnv != "" {
++			tmpl.SetAsEnv = true
++			tmpl.Destination = secret.SetAsEnv
++		}
+ 		templates = append(templates, tmpl)
+ 	}
+ 	return templates
+diff --git a/agent-inject/agent/container_init_sidecar.go b/agent-inject/agent/container_init_sidecar.go
+index 3ff4ff8..5069e4c 100644
+--- a/agent-inject/agent/container_init_sidecar.go
++++ b/agent-inject/agent/container_init_sidecar.go
+@@ -93,3 +93,39 @@ func (a *Agent) ContainerInitSidecar() (corev1.Container, error) {
+ 
+ 	return newContainer, nil
+ }
++
++// InjectContainer creates a new init container to be added to the pod being
++// mutated. It copies the vault binary into a shared memory volume that can be
++// accessed in the app container.
++func (a *Agent) InjectContainer() (corev1.Container, error) {
++	// volumeMounts := a.ContainerVolumeMounts()
++	volumeMounts := []corev1.VolumeMount{
++		{
++			Name:      tokenVolumeNameSidecar,
++			MountPath: tokenVolumePath,
++			ReadOnly:  false,
++		},
++	}
++
++	arg := fmt.Sprintf("cp /bin/vault %s", tokenVolumePath)
++
++	resources, err := a.parseResources()
++	if err != nil {
++		return corev1.Container{}, err
++	}
++
++	newContainer := corev1.Container{
++		Name:  "vault-agent-direct-inject",
++		Image: a.ImageName,
++		// Env:          envs,
++		Resources:    resources,
++		VolumeMounts: volumeMounts,
++		Command:      []string{"/bin/sh", "-ec"},
++		Args:         []string{arg},
++	}
++	if a.SetSecurityContext {
++		newContainer.SecurityContext = a.securityContext()
++	}
++
++	return newContainer, nil
++}
+diff --git a/agent-inject/agent/patch.go b/agent-inject/agent/patch.go
+index 90c1d74..d347dd6 100644
+--- a/agent-inject/agent/patch.go
++++ b/agent-inject/agent/patch.go
+@@ -55,6 +55,29 @@ func addVolumeMounts(target, mounts []corev1.VolumeMount, base string) []*jsonpa
+ 	return result
+ }
+ 
++func addEnvVars(target, vars []corev1.EnvVar, base string) []*jsonpatch.JsonPatchOperation {
++	var result []*jsonpatch.JsonPatchOperation
++	first := len(target) == 0
++	var value interface{}
++	for _, v := range vars {
++		value = v
++		path := base
++		if first {
++			first = false
++			value = []corev1.EnvVar{v}
++		} else {
++			path = path + "/-"
++		}
++
++		result = append(result, &jsonpatch.JsonPatchOperation{
++			Operation: "add",
++			Path:      path,
++			Value:     value,
++		})
++	}
++	return result
++}
++
+ func removeContainers(path string) []*jsonpatch.JsonPatchOperation {
+ 	var result []*jsonpatch.JsonPatchOperation
+ 
+@@ -64,6 +87,16 @@ func removeContainers(path string) []*jsonpatch.JsonPatchOperation {
+ 	})
+ }
+ 
++func replaceSlice(newSlice []string, path string) []*jsonpatch.JsonPatchOperation {
++	var result []*jsonpatch.JsonPatchOperation
++
++	return append(result, &jsonpatch.JsonPatchOperation{
++		Operation: "replace",
++		Path:      path,
++		Value:     newSlice,
++	})
++}
++
+ func addContainers(target, containers []corev1.Container, base string) []*jsonpatch.JsonPatchOperation {
+ 	var result []*jsonpatch.JsonPatchOperation
+ 	first := len(target) == 0

@@ -1,0 +1,8 @@
+scrape_configs:
+  - job_name: vault-agent
+    metrics_path: /agent/v1/metrics
+    params:
+      format: ['prometheus']
+    scheme: http
+    static_configs:
+    - targets: ['127.0.0.1:8007']

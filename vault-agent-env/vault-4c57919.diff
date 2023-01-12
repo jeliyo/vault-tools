@@ -1,0 +1,98 @@
+diff --git a/command/agent.go b/command/agent.go
+index 31a6f7336b..018d7a6604 100644
+--- a/command/agent.go
++++ b/command/agent.go
+@@ -14,6 +14,7 @@ import (
+ 	"sort"
+ 	"strings"
+ 	"sync"
++	"syscall"
+ 	"time"
+ 
+ 	log "github.com/hashicorp/go-hclog"
+@@ -83,6 +84,8 @@ type AgentCommand struct {
+ 
+ 	flagTestVerifyOnly bool
+ 	flagCombineLogs    bool
++
++	flagWrapProcess bool
+ }
+ 
+ func (c *AgentCommand) Synopsis() string {
+@@ -141,6 +144,13 @@ func (c *AgentCommand) Flags() *FlagSets {
+ 			"all sinks successfully wrote it",
+ 	})
+ 
++	f.BoolVar(&BoolVar{
++		Name:    "wrap-process",
++		Target:  &c.flagWrapProcess,
++		Default: false,
++		Usage:   "If set to true, the agent will execute the process and args specified after --, ex `vault agent --wrap-process -- /bin/app -config configfile",
++	})
++
+ 	// Internal-only flags to follow.
+ 	//
+ 	// Why hello there little source code reader! Welcome to the Vault source
+@@ -184,6 +194,9 @@ func (c *AgentCommand) Run(args []string) int {
+ 		c.UI.Error(err.Error())
+ 		return 1
+ 	}
++	c.UI.Info(fmt.Sprintf("args after parsing is %+v", args))
++	c.UI.Info(fmt.Sprintf("f.Args %+v", f.Args()))
++	c.UI.Info(fmt.Sprintf("f.mainset.Args() %+v", f.mainSet.Args()))
+ 
+ 	// Create a logger. We wrap it in a gated writer so that it doesn't
+ 	// start logging too early.
+@@ -905,6 +918,14 @@ func (c *AgentCommand) Run(args []string) int {
+ 		return 1
+ 	}
+ 
++	// And now, exec the app if set
++	if c.flagWrapProcess {
++		if err := syscall.Exec(f.Args()[0], f.Args()[1:], os.Environ()); err != nil {
++			c.logger.Error("error exec'ing app %+v: %s", f.Args(), err)
++			return 1
++		}
++	}
++
+ 	return 0
+ }
+ 
+diff --git a/command/agent/template/template.go b/command/agent/template/template.go
+index 3ad546787c..124bd6b010 100644
+--- a/command/agent/template/template.go
++++ b/command/agent/template/template.go
+@@ -10,6 +10,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"strings"
+ 
+ 	"go.uber.org/atomic"
+@@ -188,6 +189,7 @@ func (ts *Server) Run(ctx context.Context, incoming chan string, templates []*ct
+ 			go ts.runner.Start()
+ 
+ 		case <-ts.runner.TemplateRenderedCh():
++			ts.logger.Debug("os env is ", "env", os.Environ())
+ 			// A template has been rendered, figure out what to do
+ 			events := ts.runner.RenderEvents()
+ 
+@@ -211,6 +213,7 @@ func (ts *Server) Run(ctx context.Context, incoming chan string, templates []*ct
+ 				// if we want to exit after auth, go ahead and shut down the runner and
+ 				// return. The deferred closing of the DoneCh will allow agent to
+ 				// continue with closing down
++				ts.logger.Debug("os env is ", "env", os.Environ())
+ 				ts.runner.Stop()
+ 				return nil
+ 			}
+diff --git a/go.mod b/go.mod
+index 85ddbf1826..69890372cc 100644
+--- a/go.mod
++++ b/go.mod
+@@ -382,3 +382,5 @@ require (
+ 	sigs.k8s.io/structured-merge-diff/v4 v4.1.2 // indirect
+ 	sigs.k8s.io/yaml v1.2.0 // indirect
+ )
++
++replace github.com/hashicorp/consul-template => ./consul-template

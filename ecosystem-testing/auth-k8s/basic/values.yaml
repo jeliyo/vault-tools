@@ -1,0 +1,23 @@
+injector:
+#   image:
+#     tag: dev
+  agentImage:
+    tag: dev
+    repository: vault
+  logLevel: debug
+  affinity: ""
+  replicas: 2
+
+server:
+  image:
+    tag: dev
+    repository: vault
+  dev:
+    enabled: true
+#   ha:
+#     enabled: true
+#     replicas: 3
+#     raft:
+#       enabled: true
+  logLevel: debug
+  affinity: ""

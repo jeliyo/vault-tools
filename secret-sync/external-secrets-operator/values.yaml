@@ -1,0 +1,12 @@
+injector:
+  enabled: false
+
+server:
+#   image:
+#     tag: 1.11.1_2a5098dc9210dc46a3fe7e4bfb2bae1583ad3f4b
+#     repository: vault/default/linux/amd64
+#   image:
+#     tag: 1.11.0
+  dev:
+    enabled: true
+  logLevel: debug

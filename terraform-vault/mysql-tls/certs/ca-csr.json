@@ -1,0 +1,16 @@
+{
+  "CN": "Prototype Test Certificate Authority",
+  "key": {
+    "algo": "rsa",
+    "size": 2048
+  },
+  "names": [
+    {
+      "C": "US",
+      "L": "San Francisco",
+      "O": "HashiCorp",
+      "OU": "Test Certificate Authority",
+      "ST": "California"
+    }
+  ]
+}
